@@ -365,9 +365,25 @@ pub fn encrypted_credentials_path() -> PathBuf {
     crate::auth_commands::config_dir().join("credentials.enc")
 }
 
-/// Saves credentials JSON to an encrypted file.
+/// Returns the path for encrypted credentials within a specific profile.
+pub fn encrypted_credentials_path_for_profile(
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
+) -> PathBuf {
+    crate::profile::profile_dir(base_dir, profile).join("credentials.enc")
+}
+
+/// Saves credentials JSON to an encrypted file using the default key.
+#[allow(dead_code)]
 pub fn save_encrypted(json: &str) -> anyhow::Result<PathBuf> {
     let path = encrypted_credentials_path();
+    save_encrypted_to_path(json, &path)?;
+    Ok(path)
+}
+
+/// Saves credentials JSON to a specific encrypted file path using the default key.
+#[allow(dead_code)]
+pub fn save_encrypted_to_path(json: &str, path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -387,10 +403,39 @@ pub fn save_encrypted(json: &str) -> anyhow::Result<PathBuf> {
 
     // Write atomically via a sibling .tmp file + rename so the credentials
     // file is never left in a corrupt partial-write state on crash/Ctrl-C.
-    crate::fs_util::atomic_write(&path, &encrypted)
+    crate::fs_util::atomic_write(path, &encrypted)
         .map_err(|e| anyhow::anyhow!("Failed to write credentials: {e}"))?;
 
-    Ok(path)
+    Ok(())
+}
+
+/// Saves credentials JSON encrypted using a profile-specific key.
+pub fn save_encrypted_for_profile(
+    json: &str,
+    path: &std::path::Path,
+    key_file: &std::path::Path,
+    profile: &str,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                eprintln!(
+                    "Warning: failed to set directory permissions on {}: {e}",
+                    parent.display()
+                );
+            }
+        }
+    }
+
+    let encrypted = encrypt_for_profile(json.as_bytes(), key_file, profile)?;
+    crate::fs_util::atomic_write(path, &encrypted)
+        .map_err(|e| anyhow::anyhow!("Failed to write credentials: {e}"))?;
+
+    Ok(())
 }
 
 /// Loads and decrypts credentials JSON from a specific path.
@@ -400,9 +445,88 @@ pub fn load_encrypted_from_path(path: &std::path::Path) -> anyhow::Result<String
     Ok(String::from_utf8(plaintext)?)
 }
 
+/// Loads and decrypts credentials JSON from a specific path using a profile-specific key.
+pub fn load_encrypted_for_profile(
+    path: &std::path::Path,
+    key_file: &std::path::Path,
+    profile: &str,
+) -> anyhow::Result<String> {
+    let data = std::fs::read(path)?;
+    let plaintext = decrypt_for_profile(&data, key_file, profile)?;
+    Ok(String::from_utf8(plaintext)?)
+}
+
 /// Loads and decrypts credentials JSON from the default encrypted file.
 pub fn load_encrypted() -> anyhow::Result<String> {
     load_encrypted_from_path(&encrypted_credentials_path())
+}
+
+/// Encrypt plaintext using a profile-specific key.
+///
+/// The key is resolved from the profile's own key file and keyring entry
+/// (`gws-cli` / `<username>/<profile>`), separate from the default key.
+pub fn encrypt_for_profile(
+    plaintext: &[u8],
+    key_file: &std::path::Path,
+    profile: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let key = get_or_create_key_for_profile(key_file, profile)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+
+    let mut result = nonce.to_vec();
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+/// Decrypt data using a profile-specific key.
+pub fn decrypt_for_profile(
+    data: &[u8],
+    key_file: &std::path::Path,
+    profile: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if data.len() < 12 {
+        anyhow::bail!("Encrypted data too short");
+    }
+
+    let key = get_or_create_key_for_profile(key_file, profile)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
+
+    let nonce = Nonce::from_slice(&data[..12]);
+    let plaintext = cipher.decrypt(nonce, &data[12..]).map_err(|_| {
+        anyhow::anyhow!(
+            "Decryption failed for profile '{profile}'. Credentials may have been created \
+             on a different machine. Run `gws auth logout` and `gws auth login` to re-authenticate."
+        )
+    })?;
+
+    Ok(plaintext)
+}
+
+/// Resolve or create a per-profile encryption key.
+///
+/// Uses a profile-scoped keyring entry (`gws-cli` / `<username>/<profile>`)
+/// and a profile-specific key file, completely isolated from other profiles.
+fn get_or_create_key_for_profile(
+    key_file: &std::path::Path,
+    profile: &str,
+) -> anyhow::Result<[u8; 32]> {
+    let backend = KeyringBackend::from_env();
+
+    let username = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown-user".to_string());
+
+    let keyring_user = format!("{}/{}", username, profile);
+    let provider = OsKeyring::new("gws-cli", &keyring_user);
+
+    resolve_key(backend, &provider, key_file)
 }
 
 #[cfg(test)]

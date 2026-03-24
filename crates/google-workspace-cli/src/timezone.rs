@@ -35,13 +35,29 @@ fn cache_path() -> PathBuf {
     crate::auth_commands::config_dir().join(CACHE_FILENAME)
 }
 
-/// Remove the cached timezone file. Called on auth login/logout to
-/// invalidate stale values when the account changes.
+/// Remove the cached timezone file from the root config directory.
+///
+/// Kept for backward compatibility; new code should use
+/// [`invalidate_cache_for_profile`] instead.
+#[allow(dead_code)]
 pub fn invalidate_cache() {
     let path = cache_path();
     if let Err(e) = std::fs::remove_file(&path) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(path = %path.display(), error = %e, "failed to invalidate timezone cache");
+        }
+    }
+}
+
+/// Remove the cached timezone file for a specific profile.
+pub fn invalidate_cache_for_profile(
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
+) {
+    let path = crate::profile::profile_dir(base_dir, profile).join(CACHE_FILENAME);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), error = %e, "failed to invalidate timezone cache for profile");
         }
     }
 }

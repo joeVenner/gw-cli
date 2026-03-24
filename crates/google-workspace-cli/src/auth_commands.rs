@@ -119,6 +119,7 @@ pub fn config_dir() -> PathBuf {
     primary
 }
 
+#[allow(dead_code)]
 fn plain_credentials_path() -> PathBuf {
     if let Ok(path) = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") {
         return PathBuf::from(path);
@@ -126,6 +127,7 @@ fn plain_credentials_path() -> PathBuf {
     config_dir().join("credentials.json")
 }
 
+#[allow(dead_code)]
 fn token_cache_path() -> PathBuf {
     config_dir().join("token_cache.json")
 }
@@ -211,10 +213,47 @@ fn auth_command() -> clap::Command {
                 ),
         )
         .subcommand(clap::Command::new("logout").about("Clear saved credentials and token cache"))
+        .subcommand(
+            clap::Command::new("profile")
+                .about("Manage authentication profiles for multiple accounts")
+                .subcommand_required(true)
+                .subcommand(clap::Command::new("list").about("List all profiles"))
+                .subcommand(clap::Command::new("show").about("Show the active profile name"))
+                .subcommand(
+                    clap::Command::new("create")
+                        .about("Create a new profile")
+                        .arg(
+                            clap::Arg::new("name")
+                                .required(true)
+                                .help("Profile name (lowercase alphanumeric, '_', '-')"),
+                        ),
+                )
+                .subcommand(
+                    clap::Command::new("switch")
+                        .about("Set the active profile")
+                        .arg(
+                            clap::Arg::new("name")
+                                .required(true)
+                                .help("Profile name to switch to"),
+                        ),
+                )
+                .subcommand(
+                    clap::Command::new("delete")
+                        .about("Delete a profile and all its credentials")
+                        .arg(
+                            clap::Arg::new("name")
+                                .required(true)
+                                .help("Profile name to delete"),
+                        ),
+                ),
+        )
 }
 
 /// Handle `gws auth <subcommand>`.
-pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
+pub async fn handle_auth_command(
+    args: &[String],
+    profile_override: Option<&str>,
+) -> Result<(), GwsError> {
     let matches = match auth_command()
         .try_get_matches_from(std::iter::once("auth".to_string()).chain(args.iter().cloned()))
     {
@@ -231,11 +270,20 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
         Err(e) => return Err(GwsError::Validation(e.to_string())),
     };
 
+    // Resolve profile for commands that need it (login, status, logout, export).
+    // Profile subcommand handles its own resolution.
+    let base_dir = config_dir();
+
+    // Run migration if needed (one-time flat → profiles/ layout)
+    crate::profile::migrate_to_profiles(&base_dir).await?;
+
+    let profile = crate::profile::resolve_active_profile(profile_override, &base_dir)?;
+
     match matches.subcommand() {
         Some(("login", sub_m)) => {
             let (scope_mode, services_filter) = parse_login_args(sub_m);
 
-            handle_login_inner(scope_mode, services_filter).await
+            handle_login_inner(scope_mode, services_filter, &base_dir, &profile).await
         }
         Some(("setup", sub_m)) => {
             // Collect remaining args and delegate to setup's own clap parser.
@@ -245,12 +293,13 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
                 .unwrap_or_default();
             crate::setup::run_setup(&setup_args).await
         }
-        Some(("status", _)) => handle_status().await,
+        Some(("status", _)) => handle_status(&base_dir, &profile).await,
         Some(("export", sub_m)) => {
             let unmasked = sub_m.get_flag("unmasked");
-            handle_export(unmasked).await
+            handle_export(unmasked, &base_dir, &profile).await
         }
-        Some(("logout", _)) => handle_logout(),
+        Some(("logout", _)) => handle_logout(&base_dir, &profile).await,
+        Some(("profile", sub_m)) => handle_profile_command(sub_m).await,
         _ => {
             // No subcommand → print help
             auth_command()
@@ -319,7 +368,12 @@ pub async fn run_login(args: &[String]) -> Result<(), GwsError> {
 
     let (scope_mode, services_filter) = parse_login_args(&matches);
 
-    handle_login_inner(scope_mode, services_filter).await
+    // Default profile when called from setup.rs (no --profile context)
+    let base_dir = config_dir();
+    let profile = crate::profile::resolve_active_profile(None, &base_dir)?;
+    crate::profile::migrate_to_profiles(&base_dir).await?;
+
+    handle_login_inner(scope_mode, services_filter, &base_dir, &profile).await
 }
 /// Custom delegate that prints the OAuth URL on its own line for easy copying.
 /// Optionally includes `login_hint` in the URL for account pre-selection.
@@ -361,7 +415,12 @@ impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelega
 async fn handle_login_inner(
     scope_mode: ScopeMode,
     services_filter: Option<HashSet<String>>,
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
 ) -> Result<(), GwsError> {
+    // Ensure profile directory exists
+    let profile_dir = crate::profile::ensure_profile_dir(base_dir, profile).await?;
+    let key_file = profile_dir.join(".encryption_key");
     // Resolve client_id and client_secret:
     // 1. Env vars (highest priority)
     // 2. Saved client_secret.json from `gws auth setup` or manual download
@@ -408,24 +467,22 @@ async fn handle_login_inner(
     }
 
     // Use a temp file for yup-oauth2's token persistence, then encrypt it
-    let temp_path = config_dir().join("credentials.tmp");
+    let temp_path = profile_dir.join("credentials.tmp");
 
     // Always start fresh — delete any stale temp cache from prior login attempts.
     let _ = std::fs::remove_file(&temp_path);
-
-    // Ensure config directory exists
-    if let Some(parent) = temp_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| GwsError::Validation(format!("Failed to create config directory: {e}")))?;
-    }
 
     let auth = yup_oauth2::InstalledFlowAuthenticator::builder(
         secret,
         yup_oauth2::InstalledFlowReturnMethod::HTTPRedirect,
     )
-    .with_storage(Box::new(crate::token_storage::EncryptedTokenStorage::new(
-        temp_path.clone(),
-    )))
+    .with_storage(Box::new(
+        crate::token_storage::EncryptedTokenStorage::new_with_profile(
+            temp_path.clone(),
+            key_file.clone(),
+            profile.as_str().to_string(),
+        ),
+    ))
     .force_account_selection(true) // Adds prompt=consent so Google always returns a refresh_token
     .flow_delegate(Box::new(CliFlowDelegate { login_hint: None }))
     .build()
@@ -444,7 +501,10 @@ async fn handle_login_inner(
         // EncryptedTokenStorage stores data encrypted, so we must decrypt first.
         let token_data = std::fs::read(&temp_path)
             .ok()
-            .and_then(|bytes| crate::credential_store::decrypt(&bytes).ok())
+            .and_then(|bytes| {
+                crate::credential_store::decrypt_for_profile(&bytes, &key_file, profile.as_str())
+                    .ok()
+            })
             .and_then(|decrypted| String::from_utf8(decrypted).ok())
             .unwrap_or_default();
         let refresh_token = extract_refresh_token(&token_data).ok_or_else(|| {
@@ -470,9 +530,15 @@ async fn handle_login_inner(
         let access_token = token.token().unwrap_or_default();
         let actual_email = fetch_userinfo_email(access_token).await;
 
-        // Save encrypted credentials
-        let enc_path = credential_store::save_encrypted(&creds_str)
-            .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+        // Save encrypted credentials to profile-specific path
+        let enc_path = credential_store::encrypted_credentials_path_for_profile(base_dir, profile);
+        credential_store::save_encrypted_for_profile(
+            &creds_str,
+            &enc_path,
+            &key_file,
+            profile.as_str(),
+        )
+        .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
 
         // Clean up temp file
         let _ = std::fs::remove_file(&temp_path);
@@ -480,6 +546,7 @@ async fn handle_login_inner(
         let output = json!({
             "status": "success",
             "message": "Authentication successful. Encrypted credentials saved.",
+            "profile": profile.as_str(),
             "account": actual_email.as_deref().unwrap_or("(unknown)"),
             "credentials_file": enc_path.display().to_string(),
             "encryption": "AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)",
@@ -520,15 +587,21 @@ async fn fetch_userinfo_email(access_token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn handle_export(unmasked: bool) -> Result<(), GwsError> {
-    let enc_path = credential_store::encrypted_credentials_path();
+async fn handle_export(
+    unmasked: bool,
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
+) -> Result<(), GwsError> {
+    let enc_path = credential_store::encrypted_credentials_path_for_profile(base_dir, profile);
     if !enc_path.exists() {
-        return Err(GwsError::Auth(
-            "No encrypted credentials found. Run 'gws auth login' first.".to_string(),
-        ));
+        return Err(GwsError::Auth(format!(
+            "No encrypted credentials found for profile '{}'. Run 'gws auth login' first.",
+            profile.as_str()
+        )));
     }
 
-    match credential_store::load_encrypted() {
+    let key_file = crate::profile::profile_dir(base_dir, profile).join(".encryption_key");
+    match credential_store::load_encrypted_for_profile(&enc_path, &key_file, profile.as_str()) {
         Ok(contents) => {
             if unmasked {
                 println!("{contents}");
@@ -1039,10 +1112,15 @@ fn run_simple_scope_picker(services_filter: Option<&HashSet<String>>) -> Option<
     }
 }
 
-async fn handle_status() -> Result<(), GwsError> {
-    let plain_path = plain_credentials_path();
-    let enc_path = credential_store::encrypted_credentials_path();
-    let token_cache = token_cache_path();
+async fn handle_status(
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
+) -> Result<(), GwsError> {
+    let profile_dir = crate::profile::profile_dir(base_dir, profile);
+    let enc_path = credential_store::encrypted_credentials_path_for_profile(base_dir, profile);
+    let plain_path = profile_dir.join("credentials.json");
+    let token_cache = profile_dir.join("token_cache.json");
+    let key_file = profile_dir.join(".encryption_key");
 
     let has_encrypted = enc_path.exists();
     let has_plain = plain_path.exists();
@@ -1063,6 +1141,7 @@ async fn handle_status() -> Result<(), GwsError> {
     };
 
     let mut output = json!({
+        "profile": profile.as_str(),
         "auth_method": auth_method,
         "storage": storage,
         "keyring_backend": credential_store::active_backend_name(),
@@ -1129,7 +1208,11 @@ async fn handle_status() -> Result<(), GwsError> {
     // Skip real credential/network access in test builds
     if !cfg!(test) {
         if has_encrypted {
-            match credential_store::load_encrypted() {
+            match credential_store::load_encrypted_for_profile(
+                &enc_path,
+                &key_file,
+                profile.as_str(),
+            ) {
                 Ok(contents) => {
                     if let Ok(creds) = serde_json::from_str::<serde_json::Value>(&contents) {
                         if let Some(client_id) = creds.get("client_id").and_then(|v| v.as_str()) {
@@ -1187,7 +1270,8 @@ async fn handle_status() -> Result<(), GwsError> {
     // Skip all network calls and subprocess spawning in test builds
     if !cfg!(test) {
         let creds_json_str = if has_encrypted {
-            credential_store::load_encrypted().ok()
+            credential_store::load_encrypted_for_profile(&enc_path, &key_file, profile.as_str())
+                .ok()
         } else if has_plain {
             tokio::fs::read_to_string(&plain_path).await.ok()
         } else {
@@ -1290,35 +1374,44 @@ async fn handle_status() -> Result<(), GwsError> {
     Ok(())
 }
 
-fn handle_logout() -> Result<(), GwsError> {
-    let plain_path = plain_credentials_path();
-    let enc_path = credential_store::encrypted_credentials_path();
-    let token_cache = token_cache_path();
-    let sa_token_cache = config_dir().join("sa_token_cache.json");
+async fn handle_logout(
+    base_dir: &std::path::Path,
+    profile: &crate::profile::ProfileName,
+) -> Result<(), GwsError> {
+    let profile_dir = crate::profile::profile_dir(base_dir, profile);
+    let enc_path = credential_store::encrypted_credentials_path_for_profile(base_dir, profile);
+    let plain_path = profile_dir.join("credentials.json");
+    let token_cache = profile_dir.join("token_cache.json");
+    let sa_token_cache = profile_dir.join("sa_token_cache.json");
 
     let mut removed = Vec::new();
 
     for path in [&enc_path, &plain_path, &token_cache, &sa_token_cache] {
         if path.exists() {
-            std::fs::remove_file(path).map_err(|e| {
-                GwsError::Validation(format!("Failed to remove {}: {e}", path.display()))
-            })?;
-            removed.push(path.display().to_string());
+            // Warn but don't fail on individual file removal errors (lesson from previous PR)
+            match std::fs::remove_file(path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) => {
+                    eprintln!("Warning: failed to remove {}: {e}", path.display());
+                }
+            }
         }
     }
 
     // Invalidate cached account timezone (may belong to old account)
-    crate::timezone::invalidate_cache();
+    crate::timezone::invalidate_cache_for_profile(base_dir, profile);
 
     let output = if removed.is_empty() {
         json!({
             "status": "success",
-            "message": "No credentials found to remove.",
+            "profile": profile.as_str(),
+            "message": format!("No credentials found to remove for profile '{}'.", profile.as_str()),
         })
     } else {
         json!({
             "status": "success",
-            "message": "Logged out. All credentials and token caches removed.",
+            "profile": profile.as_str(),
+            "message": format!("Logged out of profile '{}'. All credentials and token caches removed.", profile.as_str()),
             "removed": removed,
         })
     };
@@ -1328,6 +1421,86 @@ fn handle_logout() -> Result<(), GwsError> {
         serde_json::to_string_pretty(&output).unwrap_or_default()
     );
     Ok(())
+}
+
+/// Handle `gws auth profile <subcommand>`.
+async fn handle_profile_command(matches: &clap::ArgMatches) -> Result<(), GwsError> {
+    let base_dir = config_dir();
+
+    match matches.subcommand() {
+        Some(("list", _)) => {
+            let profiles = crate::profile::list_profiles(&base_dir).await?;
+            let items: Vec<serde_json::Value> = profiles
+                .iter()
+                .map(|(name, active)| {
+                    json!({
+                        "name": name,
+                        "active": active,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "profiles": items })).unwrap_or_default()
+            );
+            Ok(())
+        }
+        Some(("show", _)) => {
+            let profile = crate::profile::resolve_active_profile(None, &base_dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "active_profile": profile.as_str(),
+                }))
+                .unwrap_or_default()
+            );
+            Ok(())
+        }
+        Some(("create", sub_m)) => {
+            let name = sub_m.get_one::<String>("name").expect("name is required");
+            let profile = crate::profile::ProfileName::new(name)?;
+            let dir = crate::profile::create_profile(&base_dir, &profile).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "success",
+                    "message": format!("Profile '{}' created.", profile.as_str()),
+                    "path": dir.display().to_string(),
+                }))
+                .unwrap_or_default()
+            );
+            Ok(())
+        }
+        Some(("switch", sub_m)) => {
+            let name = sub_m.get_one::<String>("name").expect("name is required");
+            let profile = crate::profile::ProfileName::new(name)?;
+            crate::profile::set_active_profile(&base_dir, &profile).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "success",
+                    "message": format!("Switched to profile '{}'.", profile.as_str()),
+                }))
+                .unwrap_or_default()
+            );
+            Ok(())
+        }
+        Some(("delete", sub_m)) => {
+            let name = sub_m.get_one::<String>("name").expect("name is required");
+            let profile = crate::profile::ProfileName::new(name)?;
+            crate::profile::delete_profile(&base_dir, &profile).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "success",
+                    "message": format!("Profile '{}' deleted.", profile.as_str()),
+                }))
+                .unwrap_or_default()
+            );
+            Ok(())
+        }
+        _ => unreachable!("subcommand_required(true) ensures a subcommand is always present"),
+    }
 }
 
 /// Extract refresh_token from yup-oauth2 v12 token cache.
@@ -1740,7 +1913,7 @@ mod tests {
     #[tokio::test]
     async fn handle_auth_command_empty_args_prints_usage() {
         let args: Vec<String> = vec![];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         // Empty args now prints usage and returns Ok
         assert!(result.is_ok());
     }
@@ -1748,21 +1921,21 @@ mod tests {
     #[tokio::test]
     async fn handle_auth_command_help_flag_returns_ok() {
         let args = vec!["--help".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn handle_auth_command_help_short_flag_returns_ok() {
         let args = vec!["-h".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn handle_auth_command_invalid_subcommand() {
         let args = vec!["frobnicate".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             GwsError::Validation(msg) => assert!(msg.contains("frobnicate")),
@@ -1815,7 +1988,7 @@ mod tests {
     async fn handle_status_succeeds_without_credentials() {
         // status should always succeed and report "none"
         let args = vec!["status".to_string()];
-        let result = handle_auth_command(&args).await;
+        let result = handle_auth_command(&args, None).await;
         assert!(result.is_ok());
     }
 

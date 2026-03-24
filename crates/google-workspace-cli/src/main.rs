@@ -34,6 +34,7 @@ mod helpers;
 mod logging;
 mod oauth_config;
 mod output;
+pub(crate) mod profile;
 mod schema;
 mod services;
 mod setup;
@@ -70,26 +71,38 @@ async fn run() -> Result<(), GwsError> {
         ));
     }
 
-    // Find the first non-flag arg (skip --api-version and its value)
+    // Find the first non-flag arg (skip --api-version, --profile and their values)
     let mut first_arg: Option<String> = None;
+    let mut profile_override: Option<String> = None;
     {
-        let mut skip_next = false;
-        for a in args.iter().skip(1) {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
+        let mut i = 1; // skip argv[0]
+        while i < args.len() {
+            let a = &args[i];
             if a == "--api-version" {
-                skip_next = true;
+                i += 2; // skip flag and its value
                 continue;
             }
             if a.starts_with("--api-version=") {
+                i += 1;
+                continue;
+            }
+            if a == "--profile" {
+                if let Some(val) = args.get(i + 1) {
+                    profile_override = Some(val.clone());
+                }
+                i += 2; // skip flag and its value
+                continue;
+            }
+            if let Some(val) = a.strip_prefix("--profile=") {
+                profile_override = Some(val.to_string());
+                i += 1;
                 continue;
             }
             if !a.starts_with("--") || a.as_str() == "--help" || a.as_str() == "--version" {
                 first_arg = Some(a.clone());
                 break;
             }
+            i += 1;
         }
     }
     let first_arg = first_arg.ok_or_else(|| {
@@ -134,8 +147,24 @@ async fn run() -> Result<(), GwsError> {
 
     // Handle the `auth` command
     if first_arg == "auth" {
-        let auth_args: Vec<String> = args.iter().skip(2).cloned().collect();
-        return auth_commands::handle_auth_command(&auth_args).await;
+        // Strip --profile (and its value) from auth args since it's already extracted.
+        let mut auth_args: Vec<String> = Vec::new();
+        let mut skip_next = false;
+        for a in args.iter().skip(2) {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if a == "--profile" {
+                skip_next = true;
+                continue;
+            }
+            if a.starts_with("--profile=") {
+                continue;
+            }
+            auth_args.push(a.clone());
+        }
+        return auth_commands::handle_auth_command(&auth_args, profile_override.as_deref()).await;
     }
 
     // Parse service name and optional version override
@@ -354,11 +383,11 @@ pub fn filter_args_for_subcommand(args: &[String], service_name: &str) -> Vec<St
             skip_next = false;
             continue;
         }
-        if arg == "--api-version" {
+        if arg == "--api-version" || arg == "--profile" {
             skip_next = true;
             continue;
         }
-        if arg.starts_with("--api-version=") {
+        if arg.starts_with("--api-version=") || arg.starts_with("--profile=") {
             continue;
         }
         if !service_skipped && arg == service_name {

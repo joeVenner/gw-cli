@@ -24,15 +24,47 @@ use crate::output::sanitize_for_terminal;
 /// the cached tokens at rest using AES-256-GCM encryption.
 pub struct EncryptedTokenStorage {
     file_path: PathBuf,
+    /// Profile-specific key file and profile name for per-profile encryption.
+    /// When `None`, uses the default (legacy) encryption key.
+    profile_key: Option<(PathBuf, String)>,
     // Add memory cache since TokenStorage getters can be called frequently
     cache: Arc<Mutex<Option<HashMap<String, TokenInfo>>>>,
 }
 
 impl EncryptedTokenStorage {
+    #[allow(dead_code)]
     pub fn new(path: PathBuf) -> Self {
         Self {
             file_path: path,
+            profile_key: None,
             cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Create a profile-aware token storage that uses the profile's own encryption key.
+    pub fn new_with_profile(path: PathBuf, key_file: PathBuf, profile: String) -> Self {
+        Self {
+            file_path: path,
+            profile_key: Some((key_file, profile)),
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn decrypt_data(&self, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match &self.profile_key {
+            Some((key_file, profile)) => {
+                crate::credential_store::decrypt_for_profile(data, key_file, profile)
+            }
+            None => crate::credential_store::decrypt(data),
+        }
+    }
+
+    fn encrypt_data(&self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+        match &self.profile_key {
+            Some((key_file, profile)) => {
+                crate::credential_store::encrypt_for_profile(plaintext, key_file, profile)
+            }
+            None => crate::credential_store::encrypt(plaintext),
         }
     }
 
@@ -42,7 +74,7 @@ impl EncryptedTokenStorage {
             Err(_) => return HashMap::new(), // File doesn't exist yet — normal on first run
         };
 
-        let decrypted = match crate::credential_store::decrypt(&data) {
+        let decrypted = match self.decrypt_data(&data) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!(
@@ -79,7 +111,7 @@ impl EncryptedTokenStorage {
 
     async fn save_to_disk(&self, map: &HashMap<String, TokenInfo>) -> anyhow::Result<()> {
         let json = serde_json::to_string(map)?;
-        let encrypted = crate::credential_store::encrypt(json.as_bytes())?;
+        let encrypted = self.encrypt_data(json.as_bytes())?;
 
         if let Some(parent) = self.file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {

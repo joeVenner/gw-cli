@@ -350,6 +350,62 @@ pub fn validate_api_identifier(s: &str) -> Result<&str, GwsError> {
     Ok(s)
 }
 
+/// Maximum length for a profile name.
+const MAX_PROFILE_NAME_LEN: usize = 64;
+
+/// Validate a profile name for use as a directory name under `profiles/`.
+///
+/// Rules:
+/// - Lowercase only: `[a-z0-9_-]`
+/// - Cannot start with `-` (avoids CLI flag confusion)
+/// - Cannot be empty, `.`, or `..`
+/// - Max 64 characters
+/// - No `/`, `\`, `%`, null bytes, or control characters
+///
+/// These rules prevent:
+/// - Path traversal (`../`, `..`)
+/// - CLI flag injection (`-flag`)
+/// - URL-encoded bypasses (`%2e%2e`)
+/// - Filesystem ambiguity (uppercase on case-insensitive FS)
+pub fn validate_profile_name(name: &str) -> Result<&str, GwsError> {
+    if name.is_empty() {
+        return Err(GwsError::Validation(
+            "Profile name must not be empty".to_string(),
+        ));
+    }
+
+    if name == "." || name == ".." {
+        return Err(GwsError::Validation(format!(
+            "Profile name must not be '.' or '..': {name}"
+        )));
+    }
+
+    if name.len() > MAX_PROFILE_NAME_LEN {
+        return Err(GwsError::Validation(format!(
+            "Profile name must be at most {MAX_PROFILE_NAME_LEN} characters, got {}",
+            name.len()
+        )));
+    }
+
+    if name.starts_with('-') {
+        return Err(GwsError::Validation(format!(
+            "Profile name must not start with '-': {name}"
+        )));
+    }
+
+    // Reject any character not in [a-z0-9_-]
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(GwsError::Validation(format!(
+            "Profile name must contain only lowercase alphanumeric characters, '_', or '-': {name}"
+        )));
+    }
+
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +890,97 @@ mod tests {
             result.is_err(),
             "traversal via non-existent prefix should be rejected"
         );
+    }
+
+    // --- validate_profile_name ---
+
+    #[test]
+    fn profile_name_valid_simple() {
+        assert_eq!(validate_profile_name("default").unwrap(), "default");
+        assert_eq!(validate_profile_name("work").unwrap(), "work");
+        assert_eq!(validate_profile_name("my_profile").unwrap(), "my_profile");
+        assert_eq!(validate_profile_name("dev_01").unwrap(), "dev_01");
+        assert_eq!(validate_profile_name("a").unwrap(), "a");
+    }
+
+    #[test]
+    fn profile_name_allows_internal_hyphen() {
+        assert_eq!(validate_profile_name("my-profile").unwrap(), "my-profile");
+    }
+
+    #[test]
+    fn profile_name_rejects_empty() {
+        assert!(validate_profile_name("").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_dot_and_dotdot() {
+        assert!(validate_profile_name(".").is_err());
+        assert!(validate_profile_name("..").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_leading_hyphen() {
+        let err = validate_profile_name("-flag").unwrap_err();
+        assert!(err.to_string().contains("must not start with '-'"));
+    }
+
+    #[test]
+    fn profile_name_rejects_uppercase() {
+        assert!(validate_profile_name("Work").is_err());
+        assert!(validate_profile_name("DEFAULT").is_err());
+        assert!(validate_profile_name("myProfile").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_slash() {
+        assert!(validate_profile_name("a/b").is_err());
+        assert!(validate_profile_name("../etc").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_backslash() {
+        assert!(validate_profile_name("a\\b").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_percent() {
+        assert!(validate_profile_name("a%2e").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_control_chars() {
+        assert!(validate_profile_name("abc\0def").is_err());
+        assert!(validate_profile_name("abc\ndef").is_err());
+        assert!(validate_profile_name("abc\tdef").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_spaces() {
+        assert!(validate_profile_name("my profile").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_dots_in_name() {
+        // Dots are not allowed (only [a-z0-9_-])
+        assert!(validate_profile_name("my.profile").is_err());
+    }
+
+    #[test]
+    fn profile_name_rejects_too_long() {
+        let long = "a".repeat(65);
+        assert!(validate_profile_name(&long).is_err());
+    }
+
+    #[test]
+    fn profile_name_accepts_max_length() {
+        let max = "a".repeat(64);
+        assert!(validate_profile_name(&max).is_ok());
+    }
+
+    #[test]
+    fn profile_name_rejects_unicode() {
+        assert!(validate_profile_name("wörk").is_err());
+        assert!(validate_profile_name("工作").is_err());
     }
 }

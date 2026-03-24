@@ -149,8 +149,8 @@ impl AccessTokenProvider for FakeTokenProvider {
 /// Tries credentials in order:
 /// 0. `GOOGLE_WORKSPACE_CLI_TOKEN` env var (raw access token, highest priority)
 /// 1. `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` env var (plaintext JSON, can be User or Service Account)
-/// 2. Encrypted credentials at `~/.config/gws/credentials.enc`
-/// 3. Plaintext credentials at `~/.config/gws/credentials.json` (User only)
+/// 2. Encrypted credentials in the active profile directory
+/// 3. Plaintext credentials in the active profile directory (User only)
 /// 4. Application Default Credentials (ADC):
 ///    - `GOOGLE_APPLICATION_CREDENTIALS` env var (path to a JSON credentials file), then
 ///    - Well-known ADC path: `~/.config/gcloud/application_default_credentials.json`
@@ -163,27 +163,50 @@ pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
         }
     }
 
+    // Env var overrides bypass profiles entirely
     let creds_file = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE").ok();
-    let config_dir = crate::auth_commands::config_dir();
-    let enc_path = credential_store::encrypted_credentials_path();
-    let default_path = config_dir.join("credentials.json");
-    let token_cache = config_dir.join("token_cache.json");
 
-    let creds = load_credentials_inner(creds_file.as_deref(), &enc_path, &default_path).await?;
-    get_token_inner(scopes, creds, &token_cache).await
+    let config_dir = crate::auth_commands::config_dir();
+
+    // Resolve the active profile
+    let profile = crate::profile::resolve_active_profile(None, &config_dir).unwrap_or_else(|_| {
+        crate::profile::ProfileName::new(crate::profile::DEFAULT_PROFILE)
+            .expect("'default' is always a valid profile name")
+    });
+    let profile_dir = crate::profile::profile_dir(&config_dir, &profile);
+    let key_file = profile_dir.join(".encryption_key");
+
+    let enc_path = credential_store::encrypted_credentials_path_for_profile(&config_dir, &profile);
+    let default_path = profile_dir.join("credentials.json");
+    let token_cache = profile_dir.join("token_cache.json");
+
+    let creds = load_credentials_inner(
+        creds_file.as_deref(),
+        &enc_path,
+        &default_path,
+        Some((&key_file, profile.as_str())),
+    )
+    .await?;
+    get_token_inner(scopes, creds, &token_cache, &key_file, profile.as_str()).await
 }
 
 async fn get_token_inner(
     scopes: &[&str],
     creds: Credential,
     token_cache_path: &std::path::Path,
+    key_file: &std::path::Path,
+    profile: &str,
 ) -> anyhow::Result<String> {
     match creds {
         Credential::AuthorizedUser(secret) => {
             let auth = yup_oauth2::AuthorizedUserAuthenticator::builder(secret)
-                .with_storage(Box::new(crate::token_storage::EncryptedTokenStorage::new(
-                    token_cache_path.to_path_buf(),
-                )))
+                .with_storage(Box::new(
+                    crate::token_storage::EncryptedTokenStorage::new_with_profile(
+                        token_cache_path.to_path_buf(),
+                        key_file.to_path_buf(),
+                        profile.to_string(),
+                    ),
+                ))
                 .build()
                 .await
                 .context("Failed to build authorized user authenticator")?;
@@ -200,9 +223,14 @@ async fn get_token_inner(
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_else(|| "token_cache.json".to_string());
             let sa_cache = token_cache_path.with_file_name(format!("sa_{tc_filename}"));
-            let builder = yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(
-                Box::new(crate::token_storage::EncryptedTokenStorage::new(sa_cache)),
-            );
+            let builder =
+                yup_oauth2::ServiceAccountAuthenticator::builder(key).with_storage(Box::new(
+                    crate::token_storage::EncryptedTokenStorage::new_with_profile(
+                        sa_cache,
+                        key_file.to_path_buf(),
+                        profile.to_string(),
+                    ),
+                ));
 
             let auth = builder
                 .build()
@@ -257,6 +285,7 @@ async fn load_credentials_inner(
     env_file: Option<&str>,
     enc_path: &std::path::Path,
     default_path: &std::path::Path,
+    profile_key: Option<(&std::path::Path, &str)>,
 ) -> anyhow::Result<Credential> {
     // 1. Explicit env var — plaintext file (User or Service Account)
     if let Some(path) = env_file {
@@ -274,7 +303,12 @@ async fn load_credentials_inner(
 
     // 2. Encrypted credentials
     if enc_path.exists() {
-        match credential_store::load_encrypted_from_path(enc_path) {
+        let load_result = if let Some((key_file, profile)) = profile_key {
+            credential_store::load_encrypted_for_profile(enc_path, key_file, profile)
+        } else {
+            credential_store::load_encrypted_from_path(enc_path)
+        };
+        match load_result {
             Ok(json_str) => {
                 return parse_credential_file(enc_path, &json_str).await;
             }
@@ -411,6 +445,7 @@ mod tests {
             None,
             &PathBuf::from("/does/not/exist1"),
             &PathBuf::from("/does/not/exist2"),
+            None,
         )
         .await;
 
@@ -442,6 +477,7 @@ mod tests {
             None,
             &PathBuf::from("/missing/enc"),
             &PathBuf::from("/missing/plain"),
+            None,
         )
         .await;
 
@@ -479,6 +515,7 @@ mod tests {
             None,
             &PathBuf::from("/missing/enc"),
             &PathBuf::from("/missing/plain"),
+            None,
         )
         .await;
 
@@ -504,6 +541,7 @@ mod tests {
             None,
             &PathBuf::from("/missing/enc"),
             &PathBuf::from("/missing/plain"),
+            None,
         )
         .await;
 
@@ -521,6 +559,7 @@ mod tests {
             Some("/does/not/exist"),
             &PathBuf::from("/also/missing"),
             &PathBuf::from("/still/missing"),
+            None,
         )
         .await;
         assert!(err.is_err());
@@ -542,6 +581,7 @@ mod tests {
             Some(file.path().to_str().unwrap()),
             &PathBuf::from("/also/missing"),
             &PathBuf::from("/still/missing"),
+            None,
         )
         .await
         .unwrap();
@@ -574,6 +614,7 @@ mod tests {
             Some(file.path().to_str().unwrap()),
             &PathBuf::from("/also/missing"),
             &PathBuf::from("/still/missing"),
+            None,
         )
         .await
         .unwrap();
@@ -597,7 +638,7 @@ mod tests {
         }"#;
         file.write_all(json.as_bytes()).unwrap();
 
-        let res = load_credentials_inner(None, &PathBuf::from("/also/missing"), file.path())
+        let res = load_credentials_inner(None, &PathBuf::from("/also/missing"), file.path(), None)
             .await
             .unwrap();
 
@@ -650,7 +691,7 @@ mod tests {
         let encrypted = crate::credential_store::encrypt(json.as_bytes()).unwrap();
         std::fs::write(&enc_path, &encrypted).unwrap();
 
-        let res = load_credentials_inner(None, &enc_path, &PathBuf::from("/does/not/exist"))
+        let res = load_credentials_inner(None, &enc_path, &PathBuf::from("/does/not/exist"), None)
             .await
             .unwrap();
 
@@ -688,7 +729,7 @@ mod tests {
         std::fs::write(&enc_path, &encrypted).unwrap();
         std::fs::write(&plain_path, plain_json).unwrap();
 
-        let res = load_credentials_inner(None, &enc_path, &plain_path)
+        let res = load_credentials_inner(None, &enc_path, &plain_path, None)
             .await
             .unwrap();
 
@@ -722,7 +763,7 @@ mod tests {
         assert!(enc_path.exists());
 
         let result =
-            load_credentials_inner(None, &enc_path, &PathBuf::from("/does/not/exist")).await;
+            load_credentials_inner(None, &enc_path, &PathBuf::from("/does/not/exist"), None).await;
 
         // Should fall through to "No credentials found" (not a decryption error).
         assert!(result.is_err());
@@ -760,7 +801,7 @@ mod tests {
         }"#;
         tokio::fs::write(&plain_path, plain_json).await.unwrap();
 
-        let res = load_credentials_inner(None, &enc_path, &plain_path)
+        let res = load_credentials_inner(None, &enc_path, &plain_path, None)
             .await
             .unwrap();
 
@@ -791,6 +832,7 @@ mod tests {
             None,
             &PathBuf::from("/does/not/exist1"),
             &PathBuf::from("/does/not/exist2"),
+            None,
         )
         .await;
 
