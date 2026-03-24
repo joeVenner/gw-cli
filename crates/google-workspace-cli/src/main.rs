@@ -88,9 +88,17 @@ async fn run() -> Result<(), GwsError> {
             }
             if a == "--profile" {
                 if let Some(val) = args.get(i + 1) {
-                    profile_override = Some(val.clone());
+                    // Don't consume flags or known commands as profile values
+                    if !val.starts_with('-') {
+                        profile_override = Some(val.clone());
+                        i += 2; // skip flag and its value
+                    } else {
+                        // --profile with no value (next arg is a flag) — skip just the flag
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
                 }
-                i += 2; // skip flag and its value
                 continue;
             }
             if let Some(val) = a.strip_prefix("--profile=") {

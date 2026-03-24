@@ -30,9 +30,15 @@ const CACHE_FILENAME: &str = "account_timezone";
 /// Cache TTL in seconds (24 hours).
 const CACHE_TTL_SECS: u64 = 86400;
 
-/// Returns the path to the timezone cache file.
+/// Returns the path to the timezone cache file for the active profile.
 fn cache_path() -> PathBuf {
-    crate::auth_commands::config_dir().join(CACHE_FILENAME)
+    let base_dir = crate::auth_commands::config_dir();
+    let profile = crate::profile::resolve_active_profile(None, &base_dir)
+        .unwrap_or_else(|_| {
+            crate::profile::ProfileName::new(crate::profile::DEFAULT_PROFILE)
+                .expect("'default' is always a valid profile name")
+        });
+    crate::profile::profile_dir(&base_dir, &profile).join(CACHE_FILENAME)
 }
 
 /// Remove the cached timezone file from the root config directory.
